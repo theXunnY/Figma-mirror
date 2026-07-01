@@ -1,0 +1,11 @@
+{
+  "name": "figma-mirror",
+  "owner": { "name": "Sunny Pawar", "email": "thesunnypawar16@gmail.com" },
+  "plugins": [
+    {
+      "name": "figma-mirror",
+      "source": "./",
+      "description": "Snapshot Figma files locally so Claude works from disk instead of repeated Figma/MCP calls."
+    }
+  ]
+}
