@@ -1,6 +1,6 @@
 {
   "name": "figma-mirror",
   "description": "Snapshot Figma files locally (node trees, frame renders, assets, tokens) so Claude works from disk instead of repeated Figma/MCP calls.",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "author": { "name": "Sunny Pawar", "email": "thesunnypawar16@gmail.com" }
 }

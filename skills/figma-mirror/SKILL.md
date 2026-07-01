@@ -45,6 +45,25 @@ figma-mirror-data/
 6. Never call a Figma MCP server or WebFetch figma.com for data the mirror already has.
 7. After a resync, `git diff figma-mirror-data/` (if tracked) shows exactly what the designer changed.
 
+## Verifying the build (no manual devtools)
+
+After implementing a frame, verify against the mirror with `${CLAUDE_PLUGIN_ROOT}/scripts/verify.mjs` (zero deps; drives installed Edge/Chrome headless, deterministic rendering: animations off, fonts awaited, 2x scale matching the mirror's exports):
+
+```
+node "${CLAUDE_PLUGIN_ROOT}/scripts/verify.mjs" verify  <local-url> <frame-slug> [mirror-dir]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/verify.mjs" snap    <url> [--width N] [--out f.png]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/verify.mjs" inspect <url> <css-selector> [--width N]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/verify.mjs" diff    <a.png> <b.png> [--out diff.png]
+```
+
+Loop until MATCH. One `verify` run reports, in a single pass:
+- pixel diff split into **red** (real mismatch) and **yellow** (edge/antialiasing noise — ignore), with heatmap + verdict
+- the mismatch bounding box AND the CSS selectors of elements inside it (smallest first — usually the culprit)
+- a text-node delta table, build→figma (`"Pay now": font-size 14px→16px, y 99→101`) — matched by text content against the frame's node JSON
+
+So: 1. `verify <url> <slug>` → 2. fix exactly what the delta table / region selectors say (use `inspect` only for non-text elements the table can't match) → 3. re-run `verify`. Repeat until MATCH / NEAR-MATCH.
+Report the final verdict + heatmap path to the user — never claim a match without a MATCH/NEAR-MATCH verdict. Yellow-only diffs are font rasterization differences between Figma and browsers; accept them.
+
 ## Notes
 
 - If the design is confidential, suggest adding `figma-mirror-data/` to `.gitignore`.
