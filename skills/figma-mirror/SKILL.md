@@ -56,6 +56,8 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/verify.mjs" inspect <url> <css-selector> [--
 node "${CLAUDE_PLUGIN_ROOT}/scripts/verify.mjs" diff    <a.png> <b.png> [--out diff.png]
 ```
 
+All page-loading commands wait for network idle automatically (SPAs safe). For apps whose content appears late, add `--wait-for "<css-selector>"` to block until that element exists.
+
 Loop until MATCH. One `verify` run reports, in a single pass:
 - pixel diff split into **red** (real mismatch) and **yellow** (edge/antialiasing noise — ignore), with heatmap + verdict
 - the mismatch bounding box AND the CSS selectors of elements inside it (smallest first — usually the culprit)
@@ -63,6 +65,15 @@ Loop until MATCH. One `verify` run reports, in a single pass:
 
 So: 1. `verify <url> <slug>` → 2. fix exactly what the delta table / region selectors say (use `inspect` only for non-text elements the table can't match) → 3. re-run `verify`. Repeat until MATCH / NEAR-MATCH.
 Report the final verdict + heatmap path to the user — never claim a match without a MATCH/NEAR-MATCH verdict. Yellow-only diffs are font rasterization differences between Figma and browsers; accept them.
+
+## Rate-limit fallback chain
+
+Figma quotas are per-endpoint-tier: file content (`/files/:key`, `/files/:key/nodes`) is expensive and exhausts first; renders/assets (`/images/:key`, `/files/:key/images`) have a separate, laxer budget. On a 429 with a huge retry-after:
+
+1. **Existing mirror?** Keep working from it — that's the whole point. Structural verify works with node JSON alone (degraded mode, no reference PNG needed).
+2. **Missing renders/assets only?** `images <file-key> [mirror-dir]` — refetches them from existing node JSONs via the images-tier endpoints, usually still available when full sync is blocked.
+3. **Need fresh node data?** Check whether a Figma MCP server is configured (`claude mcp list`); if so, use it to fetch node data as a stopgap — but warn the user it may share the same account quota.
+4. **No MCP?** Ask the user whether to install one just for this, noting it may be rate-limited too — or wait for quota reset (the sync error message states the hours).
 
 ## Notes
 

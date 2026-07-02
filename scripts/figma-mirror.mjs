@@ -14,7 +14,7 @@
 //   frames/<frame>.png  2x render per frame
 //   assets/<ref>.png    image fills used in the design
 
-import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, readdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -31,6 +31,7 @@ const TOKEN = getToken();
 const DROP = new Set([
   'fillGeometry', 'strokeGeometry', 'vectorNetwork', 'exportSettings',
   'pluginData', 'sharedPluginData', 'absoluteRenderBounds',
+  'scrollBehavior', 'interactions', 'complexStrokeProperties',
 ]);
 
 function clean(node) {
@@ -60,6 +61,7 @@ async function api(path) {
     const res = await fetch(API + path, { headers: { 'X-Figma-Token': TOKEN } });
     if (res.status === 429 && attempt < 3) {
       const wait = Number(res.headers.get('retry-after') ?? 10);
+      if (wait > 120) throw new Error(`Figma rate limit: retry allowed in ${Math.round(wait / 3600)}h — API quota exhausted (free-plan monthly caps are low). Wait it out or use a token from a higher plan.`);
       console.log(`  rate limited, waiting ${wait}s...`);
       await new Promise(r => setTimeout(r, wait * 1000));
       continue;
@@ -102,7 +104,7 @@ async function sync(key, dir) {
     const res = await api(`/files/${key}/nodes?ids=${batch.map(f => f.id).join(',')}`);
     for (const f of batch) {
       const doc = res.nodes[f.id]?.document;
-      if (!doc) continue;
+      if (!doc) { console.log(`  warning: "${f.name}" (${f.id}) returned no data — skipped`); continue; }
       const cleaned = clean(doc);
       collectImageRefs(cleaned, allRefs);
       await writeFile(join(dir, 'nodes', `${f.slug}.json`), JSON.stringify(cleaned, null, 1));
@@ -110,29 +112,8 @@ async function sync(key, dir) {
     console.log(`  ${batch.length} node trees saved`);
   }
 
-  console.log('rendering frame images...');
-  const renderable = frames.filter(f => ['FRAME', 'COMPONENT', 'COMPONENT_SET', 'SECTION'].includes(f.type));
-  for (const batch of chunk(renderable, 10)) {
-    const res = await api(`/images/${key}?ids=${batch.map(f => f.id).join(',')}&format=png&scale=2`);
-    await Promise.all(batch.map(async f => {
-      const url = res.images[f.id];
-      if (url) await download(url, join(dir, 'frames', `${f.slug}.png`));
-    }));
-    console.log(`  ${batch.length} frames rendered`);
-  }
-
-  console.log('downloading image fills...');
-  if (allRefs.size) {
-    const fills = await api(`/files/${key}/images`);
-    let n = 0;
-    for (const batch of chunk([...allRefs], 5)) {
-      await Promise.all(batch.map(async ref => {
-        const url = fills.meta.images[ref];
-        if (url) { await download(url, join(dir, 'assets', `${ref}.png`)); n++; }
-      }));
-    }
-    console.log(`  ${n} assets saved`);
-  } else console.log('  none used');
+  const renderable = await renderFrames(key, dir, frames);
+  await downloadFills(key, dir, allRefs);
 
   console.log('fetching published styles...');
   const styles = await api(`/files/${key}/styles`);
@@ -166,6 +147,51 @@ async function sync(key, dir) {
   console.log(`done → ${dir}`);
 }
 
+async function renderFrames(key, dir, frames) {
+  console.log('rendering frame images...');
+  const renderable = frames.filter(f => ['FRAME', 'COMPONENT', 'COMPONENT_SET', 'SECTION'].includes(f.type));
+  for (const batch of chunk(renderable, 10)) {
+    const res = await api(`/images/${key}?ids=${batch.map(f => f.id).join(',')}&format=png&scale=2`);
+    await Promise.all(batch.map(async f => {
+      const url = res.images[f.id];
+      if (url) await download(url, join(dir, 'frames', `${f.slug}.png`));
+    }));
+    console.log(`  ${batch.length} frames rendered`);
+  }
+  return renderable;
+}
+
+async function downloadFills(key, dir, refs) {
+  console.log('downloading image fills...');
+  if (!refs.size) { console.log('  none used'); return; }
+  const fills = await api(`/files/${key}/images`);
+  let n = 0;
+  for (const batch of chunk([...refs], 5)) {
+    await Promise.all(batch.map(async ref => {
+      const url = fills.meta.images[ref];
+      if (url) { await download(url, join(dir, 'assets', `${ref}.png`)); n++; }
+    }));
+  }
+  console.log(`  ${n} assets saved`);
+}
+
+// Refetch renders + assets for an existing mirror using only the images-tier
+// endpoints — they have a separate (much laxer) rate limit than file content,
+// so this works even when a full sync is quota-blocked.
+async function images(key, dir) {
+  const files = (await readdir(join(dir, 'nodes'))).filter(f => f.endsWith('.json'));
+  if (!files.length) throw new Error(`no node JSONs in ${dir}/nodes — run a full sync first`);
+  const frames = [], refs = new Set();
+  for (const f of files) {
+    const node = JSON.parse(await readFile(join(dir, 'nodes', f), 'utf8'));
+    frames.push({ id: node.id, name: node.name, type: node.type, slug: f.replace(/\.json$/, '') });
+    collectImageRefs(node, refs);
+  }
+  await renderFrames(key, dir, frames);
+  await downloadFills(key, dir, refs);
+  console.log(`done → ${dir} (renders + assets refreshed from existing node data)`);
+}
+
 async function check(key, dir) {
   const meta = JSON.parse(await readFile(join(dir, 'meta.json'), 'utf8'));
   const live = await api(`/files/${key}?depth=1`);
@@ -193,9 +219,10 @@ function selftest() {
 
 const [cmd, key, outDir = 'figma-mirror-data'] = process.argv.slice(2);
 if (cmd === 'selftest') selftest();
-else if ((cmd === 'sync' || cmd === 'check') && key) {
+else if (['sync', 'check', 'images'].includes(cmd) && key) {
   if (!TOKEN) { console.error('no token: set FIGMA_TOKEN env var or put the token in ~/.figma-token (figma.com → settings → security → personal access tokens)'); process.exit(1); }
-  await (cmd === 'sync' ? sync : check)(key.replace(/^.*\/(design|file)\/([a-zA-Z0-9]+).*$/, '$2'), outDir);
+  const fns = { sync, check, images };
+  await fns[cmd](key.replace(/^.*\/(design|file)\/([a-zA-Z0-9]+).*$/, '$2'), outDir);
 } else {
-  console.log('usage: node figma-mirror.mjs sync|check <file-key-or-url> [out-dir]\n       node figma-mirror.mjs selftest');
+  console.log('usage: node figma-mirror.mjs sync|check|images <file-key-or-url> [out-dir]\n       node figma-mirror.mjs selftest\n       (images = refresh renders/assets only; works when full sync is rate-limited)');
 }

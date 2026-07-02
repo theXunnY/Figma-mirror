@@ -103,7 +103,8 @@ function pixelDiff(a, b) {
   const out = Buffer.alloc(w * h * 4);
   const px = (img, x, y) => { const i = (y * img.width + x) * 4; return [img.data[i], img.data[i + 1], img.data[i + 2]]; };
   const near = (p, q) => Math.abs(p[0] - q[0]) <= 32 && Math.abs(p[1] - q[1]) <= 32 && Math.abs(p[2] - q[2]) <= 32;
-  let bad = 0, aa = 0, minX = w, minY = h, maxX = -1, maxY = -1;
+  const cols = Math.ceil(w / 32), cells = new Map();
+  let bad = 0, aa = 0;
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
     const pa = px(a, x, y), pb = px(b, x, y), io = (y * w + x) * 4;
     out[io + 3] = 255;
@@ -113,28 +114,62 @@ function pixelDiff(a, b) {
       out[io] = v; out[io + 1] = v; out[io + 2] = v;
       continue;
     }
-    // Sub-pixel edge shift (antialiasing): each image has a 4-neighbor matching
-    // the other's center — text edges and 1px rounding, not a real mismatch.
+    // Sub-pixel edge shift (antialiasing): each image has a nearby pixel
+    // matching the other's center — text edges and rounding, not a real
+    // mismatch. Radius 2 (device px = 1 CSS px at 2x) absorbs the difference
+    // between Figma's and the browser's font rasterizers.
     let shiftA = false, shiftB = false;
-    for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+    outer: for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+      if (!dx && !dy) continue;
       const nx = x + dx, ny = y + dy;
       if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
       if (!shiftA && near(px(a, nx, ny), pb)) shiftA = true;
       if (!shiftB && near(px(b, nx, ny), pa)) shiftB = true;
-      if (shiftA && shiftB) break;
+      if (shiftA && shiftB) break outer;
     }
     if (shiftA && shiftB) { aa++; out[io] = 255; out[io + 1] = 200; out[io + 2] = 0; }
     else {
       bad++; out[io] = 255; out[io + 1] = 40; out[io + 2] = 40;
-      if (x < minX) minX = x; if (x > maxX) maxX = x;
-      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      const ck = ((y >> 5) * cols) + (x >> 5);
+      let cell = cells.get(ck);
+      if (!cell) cells.set(ck, cell = { count: 0, minX: x, minY: y, maxX: x, maxY: y });
+      cell.count++;
+      if (x < cell.minX) cell.minX = x; if (x > cell.maxX) cell.maxX = x;
+      if (y < cell.minY) cell.minY = y; if (y > cell.maxY) cell.maxY = y;
     }
   }
-  // Density inside the mismatch bounding box catches small-element changes a
-  // global % would hide (a fully-wrong button is <1% of a tall page).
-  const box = bad ? { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 } : null;
-  const density = box ? (100 * bad / (box.w * box.h)) : 0;
-  return { width: w, height: h, data: out, bad, aa, total: w * h, pct: 100 * bad / (w * h), aaPct: 100 * aa / (w * h), box, density };
+  // Distinct mismatch regions (not one page-spanning bounding box): 32px grid
+  // cells with bad pixels, flood-filled into clusters, largest first.
+  const clusters = clusterCells(cells, cols);
+  const box = clusters[0] ?? null;
+  const density = box ? (100 * box.bad / (box.w * box.h)) : 0;
+  return { width: w, height: h, data: out, bad, aa, total: w * h, pct: 100 * bad / (w * h), aaPct: 100 * aa / (w * h), box, density, clusters };
+}
+
+function clusterCells(cells, cols) {
+  const seen = new Set(), clusters = [];
+  for (const key of cells.keys()) {
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const stack = [key];
+    const c = { bad: 0, minX: Infinity, minY: Infinity, maxX: -1, maxY: -1 };
+    while (stack.length) {
+      const k = stack.pop(), cell = cells.get(k);
+      c.bad += cell.count;
+      if (cell.minX < c.minX) c.minX = cell.minX; if (cell.minY < c.minY) c.minY = cell.minY;
+      if (cell.maxX > c.maxX) c.maxX = cell.maxX; if (cell.maxY > c.maxY) c.maxY = cell.maxY;
+      const cx = k % cols, cy = (k / cols) | 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue;
+        const nx = cx + dx, ny = cy + dy;
+        if (nx < 0 || nx >= cols || ny < 0) continue;
+        const nk = ny * cols + nx;
+        if (cells.has(nk) && !seen.has(nk)) { seen.add(nk); stack.push(nk); }
+      }
+    }
+    clusters.push({ x: c.minX, y: c.minY, w: c.maxX - c.minX + 1, h: c.maxY - c.minY + 1, bad: c.bad });
+  }
+  return clusters.sort((a, b) => b.bad - a.bad);
 }
 
 // ---------- browser (Edge/Chrome headless over CDP) ----------
@@ -178,14 +213,16 @@ class Browser {
 
   constructor(proc, profile, ws) {
     this.proc = proc; this.profile = profile; this.ws = ws;
-    this.id = 0; this.pending = new Map(); this.waiters = new Map();
+    this.id = 0; this.pending = new Map(); this.waiters = new Map(); this.inflight = 0;
     ws.onmessage = e => {
       const m = JSON.parse(e.data);
       if (m.id && this.pending.has(m.id)) {
         const { res, rej } = this.pending.get(m.id);
         this.pending.delete(m.id);
         m.error ? rej(new Error(m.error.message)) : res(m.result);
-      } else if (m.method && this.waiters.has(m.method)) {
+      } else if (m.method === 'Network.requestWillBeSent') this.inflight++;
+      else if (m.method === 'Network.loadingFinished' || m.method === 'Network.loadingFailed') this.inflight = Math.max(0, this.inflight - 1);
+      else if (m.method && this.waiters.has(m.method)) {
         this.waiters.get(m.method)();
         this.waiters.delete(m.method);
       }
@@ -212,17 +249,43 @@ class Browser {
     return r.result.value;
   }
 
-  // Deterministic load: fixed metrics, no animations, fonts ready, layout settled.
-  async open(url, width) {
+  // Wait until no request has been in flight for quietMs — SPAs fetch data
+  // after the load event; snapping before that captures loading spinners.
+  async waitNetworkIdle(quietMs = 500, timeoutMs = 10000) {
+    const start = Date.now();
+    let quietSince = this.inflight === 0 ? Date.now() : null;
+    while (Date.now() - start < timeoutMs) {
+      if (this.inflight === 0) {
+        quietSince ??= Date.now();
+        if (Date.now() - quietSince >= quietMs) return;
+      } else quietSince = null;
+      await new Promise(r => setTimeout(r, 100));
+    }
+    console.log('  warning: network still active after 10s — snapping anyway');
+  }
+
+  // Deterministic load: fixed metrics, no animations, media paused, fonts
+  // ready, network idle, layout settled.
+  async open(url, width, waitForSel = null) {
     await this.send('Emulation.setDeviceMetricsOverride', { mobile: false, width, height: 900, deviceScaleFactor: 2 });
     await this.send('Page.enable');
+    await this.send('Network.enable');
     const loaded = this.waitFor('Page.loadEventFired');
     await this.send('Page.navigate', { url });
     await loaded;
+    await this.waitNetworkIdle();
+    if (waitForSel) await this.eval(`(async () => {
+      const t0 = Date.now();
+      while (!document.querySelector(${JSON.stringify(waitForSel)})) {
+        if (Date.now() - t0 > 15000) throw new Error('timeout waiting for selector ${waitForSel.replace(/'/g, '')}');
+        await new Promise(r => setTimeout(r, 100));
+      }
+    })()`);
     await this.eval(`(async () => {
       const s = document.createElement('style');
       s.textContent = '*,*::before,*::after{animation:none!important;transition:none!important;caret-color:transparent!important}';
       document.head.appendChild(s);
+      for (const m of document.querySelectorAll('video,audio')) { try { m.pause(); m.currentTime = 0; } catch {} }
       await document.fonts.ready;
       await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
     })()`);
@@ -253,7 +316,7 @@ function figmaTextNodes(node, origin, out = []) {
   if (node.type === 'TEXT' && node.absoluteBoundingBox && node.visible !== false) {
     const fill = (node.fills ?? []).find(f => f.type === 'SOLID' && f.visible !== false);
     out.push({
-      text: norm(node.characters),
+      text: norm(node.characters).slice(0, 300),
       x: node.absoluteBoundingBox.x - origin.x,
       y: node.absoluteBoundingBox.y - origin.y,
       fontSize: node.style?.fontSize,
@@ -272,7 +335,14 @@ function compareTextNodes(figma, dom) {
   let matched = 0;
   for (const f of figma) {
     if (!f.text) continue;
-    const el = dom.find(d => norm(d.text) === f.text);
+    // Same label can appear many times (five "Edit" buttons) — take the
+    // candidate closest to the figma node's position.
+    let el = null, bestDist = Infinity;
+    for (const d of dom) {
+      if (norm(d.text) !== f.text) continue;
+      const dist = Math.hypot(d.x - f.x, d.y - f.y);
+      if (dist < bestDist) { bestDist = dist; el = d; }
+    }
     if (!el) { deltas.push(`"${f.text.slice(0, 40)}": not found in DOM`); continue; }
     matched++;
     const diffs = [];
@@ -294,8 +364,14 @@ const DOM_TEXT_DUMP = `(() => {
     const text = walker.currentNode.textContent.trim();
     const el = walker.currentNode.parentElement;
     if (!text || !el) continue;
+    // Figma's TEXT bbox is the line box, which starts at the parent's CONTENT
+    // box (border box + padding/border) — not the parent rect (includes
+    // padding) and not a Range rect (font inline box, overflows tight
+    // line-heights).
     const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
-    out.push({ text: text.slice(0, 120), x: r.x, y: r.y, fontSize: parseFloat(cs.fontSize), fontWeight: cs.fontWeight, fontFamily: cs.fontFamily, color: cs.color });
+    const x = r.x + parseFloat(cs.paddingLeft) + parseFloat(cs.borderLeftWidth);
+    const y = r.y + parseFloat(cs.paddingTop) + parseFloat(cs.borderTopWidth);
+    out.push({ text: text.slice(0, 300), x, y, fontSize: parseFloat(cs.fontSize), fontWeight: cs.fontWeight, fontFamily: cs.fontFamily, color: cs.color });
   }
   return out;
 })()`;
@@ -332,7 +408,7 @@ function arg(name, dflt) {
 async function snap(url, width, out) {
   const b = await Browser.launch();
   try {
-    await b.open(url, width);
+    await b.open(url, width, arg('wait-for', null));
     await writeFile(out, await b.screenshot());
     console.log(`saved ${out} (page at ${width}px, 2x)`);
   } finally { await b.close(); }
@@ -347,7 +423,7 @@ const INSPECT_PROPS = [
 async function inspect(url, selector, width) {
   const b = await Browser.launch();
   try {
-    await b.open(url, width);
+    await b.open(url, width, arg('wait-for', null));
     const result = await b.eval(`(() => {
       const els = [...document.querySelectorAll(${JSON.stringify(selector)})].slice(0, 10);
       return els.map(el => {
@@ -365,7 +441,9 @@ function printDiffReport(a, b, d, out) {
   if (a.width !== b.width || a.height !== b.height)
     console.log(`size mismatch: ${a.width}x${a.height} vs ${b.width}x${b.height} (compared overlap)`);
   console.log(`diff: ${d.pct.toFixed(2)}% real mismatch (red), ${d.aaPct.toFixed(2)}% edge/antialiasing noise (yellow) → heatmap ${out}`);
-  if (d.box) console.log(`mismatch region: ${d.box.w}x${d.box.h} at (${d.box.x},${d.box.y}), ${d.density.toFixed(1)}% dense (2x px — halve for CSS px)`);
+  for (const c of (d.clusters ?? []).slice(0, 3))
+    console.log(`mismatch region: ${c.w}x${c.h} at (${c.x},${c.y}), ${c.bad} px (2x px — halve for CSS px)`);
+  if ((d.clusters?.length ?? 0) > 3) console.log(`  ...and ${d.clusters.length - 3} smaller regions`);
   const verdict = d.bad === 0 ? (d.aa ? 'MATCH (edge rendering noise only)' : 'MATCH')
     : d.pct < 1 && d.density < 15 ? 'NEAR-MATCH — likely rendering noise, confirm on heatmap'
     : d.pct < 5 ? 'LOCALIZED MISMATCH — something concrete differs, check heatmap region'
@@ -385,7 +463,8 @@ async function verify(url, slugName, mirror) {
   const node = JSON.parse(await readFile(join(mirror, 'nodes', `${slugName}.json`), 'utf8'));
   const width = Math.round(node.absoluteBoundingBox?.width ?? 1440);
   const figmaPng = join(mirror, 'frames', `${slugName}.png`);
-  if (!existsSync(figmaPng)) throw new Error(`${figmaPng} not found — resync the mirror`);
+  const hasRef = existsSync(figmaPng);
+  if (!hasRef) console.log(`no reference render at ${figmaPng} — pixel diff skipped, structural checks only`);
   const outDir = join(mirror, 'verify');
   await mkdir(outDir, { recursive: true });
   const buildPng = join(outDir, `${slugName}-build.png`);
@@ -394,24 +473,30 @@ async function verify(url, slugName, mirror) {
   console.log(`frame width ${width}px — snapping build...`);
   const b = await Browser.launch();
   try {
-    await b.open(url, width);
+    await b.open(url, width, arg('wait-for', null));
     const shot = await b.screenshot();
     await writeFile(buildPng, shot);
-    const fig = pngDecode(await readFile(figmaPng)), build = pngDecode(shot);
-    const d = pixelDiff(fig, build);
-    await writeFile(diffPng, pngEncode(d.width, d.height, d.data));
-    printDiffReport(fig, build, d, diffPng);
+    const origin = node.absoluteBoundingBox ?? { x: 0, y: 0 };
+    const cmp = compareTextNodes(figmaTextNodes(node, origin), await b.eval(DOM_TEXT_DUMP));
 
-    if (d.box) {
-      const els = await b.eval(elementsInBox({ x: d.box.x / 2, y: d.box.y / 2, w: d.box.w / 2, h: d.box.h / 2 }));
-      if (els.length) {
-        console.log('elements in mismatch region (smallest first):');
-        for (const e of els) console.log(`  ${e.selector}${e.text ? ` — "${e.text}"` : ''}`);
+    if (hasRef) {
+      const fig = pngDecode(await readFile(figmaPng)), build = pngDecode(shot);
+      const d = pixelDiff(fig, build);
+      await writeFile(diffPng, pngEncode(d.width, d.height, d.data));
+      printDiffReport(fig, build, d, diffPng);
+
+      for (const c of (d.clusters ?? []).slice(0, 3)) {
+        const els = await b.eval(elementsInBox({ x: c.x / 2, y: c.y / 2, w: c.w / 2, h: c.h / 2 }));
+        if (els.length) {
+          // Red on a text element whose computed styles all agree with the
+          // design = font rasterization difference, not a build error.
+          const rasterNote = els[0].text && !cmp.deltas.length ? ' — styles verified, likely font rasterization' : '';
+          console.log(`elements in region (${c.x},${c.y}) ${c.w}x${c.h} (smallest first)${rasterNote}:`);
+          for (const e of els) console.log(`  ${e.selector}${e.text ? ` — "${e.text}"` : ''}`);
+        }
       }
     }
 
-    const origin = node.absoluteBoundingBox ?? { x: 0, y: 0 };
-    const cmp = compareTextNodes(figmaTextNodes(node, origin), await b.eval(DOM_TEXT_DUMP));
     console.log(`\ntext-node check: ${cmp.matched}/${cmp.total} figma text nodes found in DOM`);
     if (cmp.deltas.length) {
       console.log('style deltas (build→figma):');
@@ -440,6 +525,13 @@ function selftest() {
   };
   const e = pixelDiff(mk(4), mk(5));
   console.assert(e.bad === 0 && e.aa > 0, `edge shift is AA not mismatch (red ${e.bad}, aa ${e.aa})`);
+  // two far-apart changes must report as two clusters, not one giant box
+  const cw = 200, ch = 40, base = Buffer.alloc(cw * ch * 4, 255), two = Buffer.from(base);
+  const blot = (px0, py0) => { for (let y = py0; y < py0 + 8; y++) for (let x = px0; x < px0 + 8; x++) { const i = (y * cw + x) * 4; two[i] = 0; two[i + 1] = 0; two[i + 2] = 0; } };
+  blot(5, 5); blot(150, 20);
+  const cd = pixelDiff({ width: cw, height: ch, data: base }, { width: cw, height: ch, data: two });
+  console.assert(cd.clusters.length === 2, `two clusters found (${cd.clusters.length})`);
+  console.assert(cd.clusters[0].w <= 12 && cd.clusters[1].w <= 12, 'clusters are tight boxes');
   // figma-vs-DOM text comparison
   const fig = [{ text: 'Pay now', x: 40, y: 99, fontSize: 16, fontWeight: 600, fontFamily: 'Inter', color: 'rgb(79, 70, 229)' }];
   const dom = [{ text: 'Pay now', x: 40, y: 99, fontSize: 14, fontWeight: '600', fontFamily: 'Inter, sans-serif', color: 'rgb(80, 70, 230)' }];
