@@ -266,8 +266,8 @@ class Browser {
 
   // Deterministic load: fixed metrics, no animations, media paused, fonts
   // ready, network idle, layout settled.
-  async open(url, width, waitForSel = null) {
-    await this.send('Emulation.setDeviceMetricsOverride', { mobile: false, width, height: 900, deviceScaleFactor: 2 });
+  async open(url, width, waitForSel = null, scale = 2, height = 900) {
+    await this.send('Emulation.setDeviceMetricsOverride', { mobile: false, width, height, deviceScaleFactor: scale });
     await this.send('Page.enable');
     await this.send('Network.enable');
     const loaded = this.waitFor('Page.loadEventFired');
@@ -323,6 +323,7 @@ function figmaTextNodes(node, origin, out = []) {
       fontWeight: node.style?.fontWeight,
       fontFamily: node.style?.fontFamily,
       color: fill?.color ? `rgb(${Math.round(fill.color.r * 255)}, ${Math.round(fill.color.g * 255)}, ${Math.round(fill.color.b * 255)})` : null,
+      alpha: fill ? (fill.opacity ?? 1) * (fill.color?.a ?? 1) * (node.opacity ?? 1) : null,
     });
   }
   for (const c of node.children ?? []) figmaTextNodes(c, origin, out);
@@ -350,6 +351,7 @@ function compareTextNodes(figma, dom) {
     if (f.fontWeight && Number(el.fontWeight) !== f.fontWeight) diffs.push(`font-weight ${el.fontWeight}→${f.fontWeight}`);
     if (f.fontFamily && !el.fontFamily.toLowerCase().includes(f.fontFamily.toLowerCase().split(' ')[0])) diffs.push(`font-family "${el.fontFamily}"→"${f.fontFamily}"`);
     if (f.color && !colorNear(el.color, f.color)) diffs.push(`color ${el.color}→${f.color}`);
+    if (f.alpha != null && Math.abs((el.alpha ?? 1) - f.alpha) > 0.05) diffs.push(`opacity ${(el.alpha ?? 1).toFixed(2)}→${f.alpha.toFixed(2)}`);
     if (Math.abs(el.x - f.x) > 1.5) diffs.push(`x ${el.x.toFixed(1)}→${f.x.toFixed(1)}`);
     if (Math.abs(el.y - f.y) > 1.5) diffs.push(`y ${el.y.toFixed(1)}→${f.y.toFixed(1)}`);
     if (diffs.length) deltas.push(`"${f.text.slice(0, 40)}": ${diffs.join(', ')}`);
@@ -371,7 +373,9 @@ const DOM_TEXT_DUMP = `(() => {
     const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
     const x = r.x + parseFloat(cs.paddingLeft) + parseFloat(cs.borderLeftWidth);
     const y = r.y + parseFloat(cs.paddingTop) + parseFloat(cs.borderTopWidth);
-    out.push({ text: text.slice(0, 300), x, y, fontSize: parseFloat(cs.fontSize), fontWeight: cs.fontWeight, fontFamily: cs.fontFamily, color: cs.color });
+    const parts = (cs.color.match(/rgba?\\(([^)]+)\\)/) ?? [, ''])[1].split(',').map(parseFloat);
+    const alpha = (isNaN(parts[3]) ? 1 : parts[3]) * parseFloat(cs.opacity);
+    out.push({ text: text.slice(0, 300), x, y, fontSize: parseFloat(cs.fontSize), fontWeight: cs.fontWeight, fontFamily: cs.fontFamily, color: cs.color, alpha });
   }
   return out;
 })()`;
@@ -437,12 +441,12 @@ async function inspect(url, selector, width) {
   } finally { await b.close(); }
 }
 
-function printDiffReport(a, b, d, out) {
+function printDiffReport(a, b, d, out, scale = 2) {
   if (a.width !== b.width || a.height !== b.height)
     console.log(`size mismatch: ${a.width}x${a.height} vs ${b.width}x${b.height} (compared overlap)`);
   console.log(`diff: ${d.pct.toFixed(2)}% real mismatch (red), ${d.aaPct.toFixed(2)}% edge/antialiasing noise (yellow) → heatmap ${out}`);
   for (const c of (d.clusters ?? []).slice(0, 3))
-    console.log(`mismatch region: ${c.w}x${c.h} at (${c.x},${c.y}), ${c.bad} px (2x px — halve for CSS px)`);
+    console.log(`mismatch region: ${c.w}x${c.h} at (${c.x},${c.y}), ${c.bad} px (${scale}x px — divide by ${scale} for CSS px)`);
   if ((d.clusters?.length ?? 0) > 3) console.log(`  ...and ${d.clusters.length - 3} smaller regions`);
   const verdict = d.bad === 0 ? (d.aa ? 'MATCH (edge rendering noise only)' : 'MATCH')
     : d.pct < 1 && d.density < 15 ? 'NEAR-MATCH — likely rendering noise, confirm on heatmap'
@@ -470,23 +474,36 @@ async function verify(url, slugName, mirror) {
   const buildPng = join(outDir, `${slugName}-build.png`);
   const diffPng = join(outDir, `${slugName}-diff.png`);
 
-  console.log(`frame width ${width}px — snapping build...`);
+  // Match the browser's pixel density to the reference render: REST exports
+  // are 2x, plugin-bridge screenshots may be 1x. Mismatched scales would
+  // pixel-diff garbage.
+  let scale = 2, fig = null;
+  if (hasRef) {
+    fig = pngDecode(await readFile(figmaPng));
+    scale = Math.min(4, Math.max(1, Math.round(fig.width / width)));
+  }
+  // Viewport = frame size, so a pixel-exact build produces a pixel-exact
+  // screenshot; leftover height difference is real overflow, not noise.
+  const frameH = Math.round(node.absoluteBoundingBox?.height ?? 900);
+  console.log(`frame ${width}x${frameH}px — snapping build at ${scale}x...`);
   const b = await Browser.launch();
   try {
-    await b.open(url, width, arg('wait-for', null));
+    await b.open(url, width, arg('wait-for', null), scale, frameH);
     const shot = await b.screenshot();
     await writeFile(buildPng, shot);
     const origin = node.absoluteBoundingBox ?? { x: 0, y: 0 };
     const cmp = compareTextNodes(figmaTextNodes(node, origin), await b.eval(DOM_TEXT_DUMP));
 
     if (hasRef) {
-      const fig = pngDecode(await readFile(figmaPng)), build = pngDecode(shot);
+      const build = pngDecode(shot);
       const d = pixelDiff(fig, build);
       await writeFile(diffPng, pngEncode(d.width, d.height, d.data));
-      printDiffReport(fig, build, d, diffPng);
+      if (build.height > fig.height + 2)
+        console.log(`build overflows the frame by ~${Math.round((build.height - fig.height) / scale)} CSS px — content below the frame is uncompared`);
+      printDiffReport(fig, build, d, diffPng, scale);
 
       for (const c of (d.clusters ?? []).slice(0, 3)) {
-        const els = await b.eval(elementsInBox({ x: c.x / 2, y: c.y / 2, w: c.w / 2, h: c.h / 2 }));
+        const els = await b.eval(elementsInBox({ x: c.x / scale, y: c.y / scale, w: c.w / scale, h: c.h / scale }));
         if (els.length) {
           // Red on a text element whose computed styles all agree with the
           // design = font rasterization difference, not a build error.
@@ -537,6 +554,11 @@ function selftest() {
   const dom = [{ text: 'Pay now', x: 40, y: 99, fontSize: 14, fontWeight: '600', fontFamily: 'Inter, sans-serif', color: 'rgb(80, 70, 230)' }];
   const c = compareTextNodes(fig, dom);
   console.assert(c.matched === 1 && c.deltas.length === 1 && c.deltas[0].includes('font-size 14px→16px') && !c.deltas[0].includes('color'), `delta detection (${c.deltas[0] ?? 'none'})`);
+  // opacity mismatch must be caught even when RGB matches
+  const fa = [{ text: 'Sub', x: 0, y: 0, fontSize: 14, color: 'rgb(0, 0, 0)', alpha: 0.8 }];
+  const da = [{ text: 'Sub', x: 0, y: 0, fontSize: 14, fontWeight: '400', fontFamily: 'Inter', color: 'rgb(0, 0, 0)', alpha: 1 }];
+  const ca = compareTextNodes(fa, da);
+  console.assert(ca.deltas.length === 1 && ca.deltas[0].includes('opacity 1.00→0.80'), `alpha delta (${ca.deltas[0] ?? 'none'})`);
   console.log('selftest ok');
 }
 

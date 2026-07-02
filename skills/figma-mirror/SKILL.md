@@ -72,8 +72,15 @@ Figma quotas are per-endpoint-tier: file content (`/files/:key`, `/files/:key/no
 
 1. **Existing mirror?** Keep working from it — that's the whole point. Structural verify works with node JSON alone (degraded mode, no reference PNG needed).
 2. **Missing renders/assets only?** `images <file-key> [mirror-dir]` — refetches them from existing node JSONs via the images-tier endpoints, usually still available when full sync is blocked.
-3. **Need fresh node data?** Check whether a Figma MCP server is configured (`claude mcp list`); if so, use it to fetch node data as a stopgap — but warn the user it may share the same account quota.
-4. **No MCP?** Ask the user whether to install one just for this, noting it may be rate-limited too — or wait for quota reset (the sync error message states the hours).
+3. **Need fresh node data?** `mcp-sync [mirror-dir]` — mirrors every page via the figma-mcp-go plugin bridge: **no token, no rate limits, free-plan friendly**. Requires Figma Desktop open on the file with the figma-mcp-go plugin running (one-time setup: GitHub releases of vkhanhqui/figma-mcp-go → plugin.zip → Figma: Plugins → Development → Import plugin from manifest). If the plugin isn't set up, ask the user to do those steps — the error message from mcp-sync says the same.
+4. **Neither works?** Wait for quota reset — the sync error message states the hours remaining.
+
+## figma-mcp-go bridge (optional, no-quota mode)
+
+`mcp-sync` spawns `npx -y @vkhanhqui/figma-mcp-go` over stdio and reads the design through Figma's Plugin API instead of the REST API. Mirrors all pages (node trees + screenshots + tokens.json), restores the user's original page when done. Caveats to know:
+- Reads the live editor state — unsaved edits included (REST sync reads the saved file).
+- The bridge server also exposes write tools (set_text, delete_nodes...). figma-mirror only calls read tools; never call write tools on a user's file without explicit instruction.
+- If the same server is added conversationally (`claude mcp add`), prefer `get_design_context` over `get_document` for ad-hoc questions — it is depth-limited and token-efficient. Use `mcp-sync` when the goal is the mirror.
 
 ## Notes
 
